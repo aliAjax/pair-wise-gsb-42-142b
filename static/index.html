@@ -1,7 +1,24 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>金融犯罪调查</title>
-<style>body{font:15px/1.6 system-ui,sans-serif;max-width:1200px;margin:28px auto;padding:0 20px;color:#24313c}table{border-collapse:collapse;width:100%;margin:14px 0}th,td{border:1px solid #d3dce3;padding:7px}th{background:#eef4f7}.card{background:#f7f2ff;border-left:5px solid #7256b7;padding:12px 16px}code{background:#edf0f2;padding:2px 5px}</style>
-<h1>金融犯罪调查与制裁筛查</h1><div class="card">案件严格按角色和调查员分配过滤。写入接口需要 <code>X-User</code>、<code>X-Role</code>。</div>
+<style>body{font:15px/1.6 system-ui,sans-serif;max-width:1280px;margin:28px auto;padding:0 20px;color:#24313c}table{border-collapse:collapse;width:100%;margin:14px 0}th,td{border:1px solid #d3dce3;padding:7px}th{background:#eef4f7}.card{background:#f7f2ff;border-left:5px solid #7256b7;padding:12px 16px}code{background:#edf0f2;padding:2px 5px}.ver{color:#7256b7;font-weight:600}</style>
+<h1>金融犯罪调查与制裁筛查</h1><div class="card">名单按批次发布<strong>不可变快照</strong>；交易留档命中的名单版本与明细；夜间复核只生成可撤销待办，已有案件仅追加复核记录。</div>
+<h2>名单快照</h2><table id="snapshots"><thead><tr><th>名单</th><th>版本</th><th>条目数</th><th>发布人</th><th>发布时间</th><th>来源</th><th>说明</th></tr></thead><tbody></tbody></table>
 <h2>案件</h2><table id="cases"><thead><tr><th>案件号</th><th>状态</th><th>风险</th><th>调查员</th><th>报告</th></tr></thead><tbody></tbody></table>
-<h2>交易</h2><table id="txns"><thead><tr><th>编号</th><th>金额</th><th>币种</th><th>状态</th><th>原因</th></tr></thead><tbody></tbody></table>
+<h2>交易（含筛查依据版本）</h2><table id="txns"><thead><tr><th>编号</th><th>金额</th><th>币种</th><th>状态</th><th>原因</th><th>命中快照</th><th>基线版本</th></tr></thead><tbody></tbody></table>
+<h2>复核待办</h2><table id="reviews"><thead><tr><th>ID</th><th>交易</th><th>名单</th><th>变化</th><th>旧版→新版</th><th>状态</th></tr></thead><tbody></tbody></table>
 <h2>审计时间线</h2><ol id="timeline"></ol>
-<script>async function load(){const d=await fetch('/api/state').then(r=>r.json());document.querySelector('#cases tbody').innerHTML=d.cases.map(r=>`<tr><td>${r.case_no}</td><td>${r.status}</td><td>${r.risk_score}</td><td>${r.assignee||''}</td><td>${r.report_ref||''}</td></tr>`).join('');document.querySelector('#txns tbody').innerHTML=d.transactions.map(r=>`<tr><td>${r.txn_ref}</td><td>${r.amount}</td><td>${r.currency}</td><td>${r.status}</td><td>${r.reason}</td></tr>`).join('');document.querySelector('#timeline').innerHTML=d.timeline.slice(0,20).map(x=>`<li>${x.created_at} ${x.action} ${x.details}</li>`).join('')}load()</script></html>
+<script>
+const HEADERS={'X-User':'viewer-demo','X-Role':'director'};
+async function load(){
+  const d=await fetch('/api/state',{headers:HEADERS}).then(r=>r.json());
+  document.querySelector('#cases tbody').innerHTML=d.cases.map(r=>`<tr><td>${r.case_no}</td><td>${r.status}</td><td>${r.risk_score}</td><td>${r.assignee||''}</td><td>${r.report_ref||''}</td></tr>`).join('');
+  document.querySelector('#snapshots tbody').innerHTML=(d.snapshots||[]).map(s=>`<tr><td>${s.list_name}</td><td class=ver>v${s.version}</td><td>${s.entry_count}</td><td>${s.published_by}</td><td>${s.published_at}</td><td>${s.origin}</td><td>${s.note||''}</td></tr>`).join('');
+  document.querySelector('#txns tbody').innerHTML=d.transactions.map(r=>{
+    const sd=r.screen_detail||{};
+    const base=Object.entries(sd.baseline_versions||{}).map(([k,v])=>`${k}:v${v}`).join(', ');
+    const hit=sd.match?`${sd.match.list_name} v${sd.match.snapshot_version} / ${sd.match.entry_name}`:'';
+    return `<tr><td>${r.txn_ref}</td><td>${r.amount}</td><td>${r.currency}</td><td>${r.status}</td><td>${r.reason}</td><td>${hit}</td><td><code>${base}</code></td></tr>`;
+  }).join('');
+  document.querySelector('#reviews tbody').innerHTML=(d.review_tasks||[]).map(t=>`<tr><td>${t.id}</td><td>${t.detail.txn_ref||''}</td><td>${t.list_name}</td><td>${t.change_type}</td><td>v${t.detail.old_version||'-'} → v${t.detail.new_version}</td><td>${t.status}</td></tr>`).join('');
+  document.querySelector('#timeline').innerHTML=d.timeline.slice(0,20).map(x=>`<li>${x.created_at} ${x.action} ${x.details}</li>`).join('');
+}
+load();</script></html>

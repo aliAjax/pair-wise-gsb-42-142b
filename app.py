@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -108,6 +109,58 @@ class FinancialCrimeService:
                     updated_at TEXT NOT NULL,
                     UNIQUE(list_name, normalized_name)
                 );
+                CREATE TABLE IF NOT EXISTS watchlist_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    list_name TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'publishing',
+                    content_hash TEXT NOT NULL,
+                    entry_count INTEGER NOT NULL,
+                    published_by TEXT NOT NULL,
+                    published_at TEXT NOT NULL,
+                    note TEXT NOT NULL DEFAULT '',
+                    origin TEXT NOT NULL DEFAULT 'published',
+                    UNIQUE(list_name, version)
+                );
+                CREATE TABLE IF NOT EXISTS watchlist_snapshot_entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    snapshot_id INTEGER NOT NULL REFERENCES watchlist_snapshots(id),
+                    list_name TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    seq INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    normalized_name TEXT NOT NULL,
+                    countries TEXT NOT NULL DEFAULT '[]',
+                    UNIQUE(snapshot_id, seq)
+                );
+                CREATE TABLE IF NOT EXISTS review_tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    transaction_id INTEGER NOT NULL REFERENCES transactions(id),
+                    list_name TEXT NOT NULL,
+                    old_snapshot_id INTEGER REFERENCES watchlist_snapshots(id),
+                    new_snapshot_id INTEGER NOT NULL REFERENCES watchlist_snapshots(id),
+                    change_type TEXT NOT NULL,
+                    detail TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'open',
+                    superseded_task_id INTEGER REFERENCES review_tasks(id),
+                    resolution TEXT,
+                    resolved_by TEXT,
+                    resolved_at TEXT,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS case_reviews (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    case_id INTEGER NOT NULL,
+                    task_id INTEGER REFERENCES review_tasks(id),
+                    transaction_id INTEGER REFERENCES transactions(id),
+                    list_name TEXT NOT NULL,
+                    old_snapshot_id INTEGER,
+                    new_snapshot_id INTEGER NOT NULL,
+                    change_type TEXT NOT NULL,
+                    detail TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS transactions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     txn_ref TEXT NOT NULL UNIQUE,
@@ -120,6 +173,8 @@ class FinancialCrimeService:
                     status TEXT NOT NULL,
                     risk_score REAL NOT NULL,
                     reason TEXT NOT NULL,
+                    screen_snapshot_id INTEGER REFERENCES watchlist_snapshots(id),
+                    screen_detail TEXT NOT NULL DEFAULT '{}',
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
@@ -178,7 +233,49 @@ class FinancialCrimeService:
                 );
                 CREATE INDEX IF NOT EXISTS idx_txn_entity ON transactions(entity_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_cases_status ON cases(status, risk_score DESC);
+                CREATE INDEX IF NOT EXISTS idx_snapshot_list ON watchlist_snapshots(list_name, version);
+                CREATE INDEX IF NOT EXISTS idx_snapshot_entries ON watchlist_snapshot_entries(snapshot_id);
+                CREATE INDEX IF NOT EXISTS idx_review_tasks_status ON review_tasks(status, id);
+                CREATE INDEX IF NOT EXISTS idx_case_reviews_case ON case_reviews(case_id, id);
                 """
+            )
+            self._migrate_schema(conn)
+            self._recover_interrupted_batches(conn)
+            self._migrate_legacy_watchlist(conn)
+
+    def _migrate_schema(self, conn: sqlite3.Connection) -> None:
+        existing = {r["name"] for r in conn.execute("PRAGMA table_info(transactions)").fetchall()}
+        if "screen_snapshot_id" not in existing:
+            conn.execute("ALTER TABLE transactions ADD COLUMN screen_snapshot_id INTEGER")
+        if "screen_detail" not in existing:
+            conn.execute("ALTER TABLE transactions ADD COLUMN screen_detail TEXT NOT NULL DEFAULT '{}'")
+
+    def _recover_interrupted_batches(self, conn: sqlite3.Connection) -> None:
+        """中断的发布事务不会留下半成品；残留 publishing 行只可能来自旧进程崩溃后的提交边界。"""
+        stale = conn.execute("SELECT id FROM watchlist_snapshots WHERE status='publishing'").fetchall()
+        for row in stale:
+            conn.execute("DELETE FROM watchlist_snapshot_entries WHERE snapshot_id=?", (row["id"],))
+            conn.execute("DELETE FROM watchlist_snapshots WHERE id=?", (row["id"],))
+
+    def _migrate_legacy_watchlist(self, conn: sqlite3.Connection) -> None:
+        """旧逐条名单：每个名单首次启动时冻结为 v1 历史快照，后续名单维护只能发布新批次。"""
+        rows = conn.execute(
+            "SELECT list_name FROM watchlist WHERE active=1 GROUP BY list_name"
+        ).fetchall()
+        for row in rows:
+            list_name = row["list_name"]
+            if conn.execute(
+                "SELECT 1 FROM watchlist_snapshots WHERE list_name=?", (list_name,)
+            ).fetchone():
+                continue
+            entries = conn.execute(
+                "SELECT name,normalized_name,countries FROM watchlist WHERE list_name=? AND active=1 ORDER BY id",
+                (list_name,),
+            ).fetchall()
+            self._publish_snapshot(
+                conn, list_name,
+                [{"name": r["name"], "countries": json.loads(r["countries"])} for r in entries],
+                actor="system-migration", note="旧逐条名单迁移的第一版历史快照", origin="migration",
             )
 
     def _audit(self, conn: sqlite3.Connection, actor: str, action: str, details: dict[str, Any],
@@ -290,19 +387,114 @@ class FinancialCrimeService:
             self._audit(conn, actor, "customer.created", {"customer_no": customer_no.strip()}, entity["id"])
             return dict(conn.execute("SELECT * FROM customers WHERE id=?", (cur.lastrowid,)).fetchone())
 
+    @staticmethod
+    def _canonical_entries(entries: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+        clean: dict[str, dict[str, Any]] = {}
+        for raw in entries or []:
+            name = str(raw.get("name", "")).strip()
+            normalized = normalize_name(name)
+            if not normalized:
+                raise DomainError("名单条目名称不能为空")
+            countries = sorted({str(c).strip().upper() for c in (raw.get("countries") or []) if str(c).strip()})
+            if normalized in clean:
+                raise DomainError("同批次内存在重复名单条目：%s" % name, 409)
+            clean[normalized] = {"name": name, "normalized_name": normalized, "countries": countries}
+        return [clean[k] for k in sorted(clean)]
+
+    @staticmethod
+    def _entries_hash(list_name: str, entries: list[dict[str, Any]]) -> str:
+        payload = [
+            [e["normalized_name"], e["countries"]]
+            for e in sorted(entries, key=lambda item: item["normalized_name"])
+        ]
+        digest = hashlib.sha256(
+            json.dumps([list_name, payload], ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        return "sha256:" + digest
+
+    def _publish_snapshot(self, conn: sqlite3.Connection, list_name: str,
+                          entries: list[dict[str, Any]], actor: str,
+                          note: str = "", origin: str = "published") -> dict[str, Any]:
+        """在调用方事务内发布不可变快照；批次头与条目同生共死，提交即整体可见。"""
+        list_name = list_name.strip()
+        if not list_name:
+            raise DomainError("名单名称不能为空")
+        entries = self._canonical_entries(entries)
+        content_hash = self._entries_hash(list_name, entries)
+        duplicate = conn.execute(
+            "SELECT version FROM watchlist_snapshots WHERE list_name=? AND content_hash=?",
+            (list_name, content_hash),
+        ).fetchone()
+        if duplicate:
+            raise DomainError("名单内容与第 %s 版完全相同，无需重复发布" % duplicate["version"], 409)
+        row = conn.execute(
+            "SELECT COALESCE(MAX(version),0) AS v FROM watchlist_snapshots WHERE list_name=?",
+            (list_name,),
+        ).fetchone()
+        version = row["v"] + 1
+        now = utcnow()
+        cur = conn.execute(
+            """INSERT INTO watchlist_snapshots(list_name,version,status,content_hash,entry_count,published_by,published_at,note,origin)
+               VALUES(?,?,?,?,?,?,?,?,?)""",
+            (list_name, version, "published", content_hash, len(entries), actor, now, note.strip(), origin),
+        )
+        snapshot_id = cur.lastrowid
+        conn.executemany(
+            """INSERT INTO watchlist_snapshot_entries(snapshot_id,list_name,version,seq,name,normalized_name,countries)
+               VALUES(?,?,?,?,?,?,?)""",
+            [
+                (snapshot_id, list_name, version, seq, e["name"], e["normalized_name"],
+                 json.dumps(e["countries"], ensure_ascii=False))
+                for seq, e in enumerate(entries, start=1)
+            ],
+        )
+        self._audit(
+            conn, actor, "watchlist.snapshot_published",
+            {"list_name": list_name, "version": version, "entry_count": len(entries),
+             "snapshot_id": snapshot_id, "origin": origin, "note": note.strip()},
+        )
+        return dict(conn.execute("SELECT * FROM watchlist_snapshots WHERE id=?", (snapshot_id,)).fetchone())
+
+    def publish_watchlist(self, actor: str, role: str, list_name: str,
+                          entries: list[dict[str, Any]], note: str = "") -> dict[str, Any]:
+        """主管按批次发布完整名单快照。发布与入账并发时由快照读点保证互不覆盖。"""
+        actor = clean_actor(actor)
+        require_role(role, {"supervisor"}, "发布名单批次")
+        entries = self._canonical_entries(entries)
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            snapshot = self._publish_snapshot(conn, list_name, entries, actor, note)
+            conn.execute("DELETE FROM watchlist WHERE list_name=?", (list_name.strip(),))
+            conn.executemany(
+                "INSERT INTO watchlist(list_name,name,normalized_name,countries,version,active,updated_by,updated_at) VALUES(?,?,?,?,1,1,?,?)",
+                [(snapshot["list_name"], e["name"], e["normalized_name"],
+                  json.dumps(e["countries"], ensure_ascii=False), actor, snapshot["published_at"])
+                 for e in entries],
+            )
+            return snapshot
+
     def add_or_update_watchlist(self, actor: str, role: str, list_name: str, name: str,
                                 countries: list[str] | None = None,
                                 active: bool = True, expected_version: int | None = None) -> dict[str, Any]:
+        """[兼容] 旧逐条维护：先写草稿表，再把整张名单作为不可变批次发布。
+
+        expected_version 针对旧条目的版本号；停用条目会从下一版快照中移除。
+        名单一旦以快照形式发布，依据只能通过新版本修正，不能改写历史版本。
+        """
         actor = clean_actor(actor)
         require_role(role, {"supervisor"}, "维护制裁名单")
         list_name, name = list_name.strip(), name.strip()
         normalized = normalize_name(name)
-        countries_json = json.dumps(sorted({c.strip().upper() for c in (countries or []) if c.strip()}), ensure_ascii=False)
+        countries_list = sorted({c.strip().upper() for c in (countries or []) if c.strip()})
+        countries_json = json.dumps(countries_list, ensure_ascii=False)
         if not list_name or not normalized:
             raise DomainError("名单名称和实体名称不能为空")
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute("SELECT * FROM watchlist WHERE list_name=? AND normalized_name=?", (list_name, normalized)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM watchlist WHERE list_name=? AND normalized_name=?",
+                (list_name, normalized),
+            ).fetchone()
             if row:
                 if expected_version is not None and row["version"] != int(expected_version):
                     raise DomainError("名单条目已变化，请刷新后重试", 409)
@@ -310,18 +502,41 @@ class FinancialCrimeService:
                     "UPDATE watchlist SET name=?,countries=?,active=?,version=version+1,updated_by=?,updated_at=? WHERE id=?",
                     (name, countries_json, int(bool(active)), actor, utcnow(), row["id"]),
                 )
-                self._audit(conn, actor, "watchlist.updated", {"list_name": list_name, "name": name, "active": active})
-                return dict(conn.execute("SELECT * FROM watchlist WHERE id=?", (row["id"],)).fetchone())
-            cur = conn.execute(
-                "INSERT INTO watchlist(list_name,name,normalized_name,countries,active,updated_by,updated_at) VALUES(?,?,?,?,?,?,?)",
-                (list_name, name, normalized, countries_json, int(bool(active)), actor, utcnow()),
-            )
-            self._audit(conn, actor, "watchlist.added", {"list_name": list_name, "name": name})
-            return dict(conn.execute("SELECT * FROM watchlist WHERE id=?", (cur.lastrowid,)).fetchone())
+            else:
+                conn.execute(
+                    "INSERT INTO watchlist(list_name,name,normalized_name,countries,active,updated_by,updated_at) VALUES(?,?,?,?,?,?,?)",
+                    (list_name, name, normalized, countries_json, int(bool(active)), actor, utcnow()),
+                )
+            draft_rows = conn.execute(
+                "SELECT name,countries FROM watchlist WHERE list_name=? AND active=1 ORDER BY normalized_name",
+                (list_name,),
+            ).fetchall()
+            draft = [{"name": r["name"], "countries": json.loads(r["countries"])} for r in draft_rows]
+            snapshot = None
+            latest = conn.execute(
+                "SELECT content_hash FROM watchlist_snapshots WHERE list_name=? ORDER BY version DESC LIMIT 1",
+                (list_name,),
+            ).fetchone()
+            if latest is None or latest["content_hash"] != self._entries_hash(list_name, self._canonical_entries(draft)):
+                snapshot = self._publish_snapshot(
+                    conn, list_name, draft, actor, "逐条维护接口自动发布的批次", origin="incremental",
+                )
+                conn.execute(
+                    "UPDATE watchlist SET version=? WHERE list_name=? AND active=1",
+                    (snapshot["version"], list_name),
+                )
+            self._audit(conn, actor, "watchlist.updated",
+                        {"list_name": list_name, "name": name, "active": active,
+                         "snapshot_version": snapshot["version"] if snapshot else None})
+            saved = conn.execute(
+                "SELECT * FROM watchlist WHERE list_name=? AND normalized_name=?",
+                (list_name, normalized),
+            ).fetchone()
+            return dict(saved) if saved else {"list_name": list_name, "name": name, "active": 0}
 
-    def _screen(self, counterparty_name: str, country: str) -> tuple[float, str | None]:
-        with self.connect() as conn:
-            entries = conn.execute("SELECT * FROM watchlist WHERE active=1").fetchall()
+    @staticmethod
+    def _match_entries(counterparty_name: str, country: str,
+                       entries: list[sqlite3.Row | dict[str, Any]]) -> tuple[float, dict[str, Any] | None]:
         best_score, best = 0.0, None
         for row in entries:
             countries = json.loads(row["countries"])
@@ -330,9 +545,59 @@ class FinancialCrimeService:
             score = name_similarity(counterparty_name, row["name"])
             if score > best_score:
                 best_score, best = score, row
-        if best and best_score >= 0.9:
-            return 0.95, "sanctions_match:%s:%s" % (best["list_name"], best["name"])
-        return best_score, None
+        return best_score, best
+
+    def _latest_snapshot(self, conn: sqlite3.Connection, list_name: str) -> sqlite3.Row | None:
+        return conn.execute(
+            "SELECT * FROM watchlist_snapshots WHERE list_name=? AND status='published' ORDER BY version DESC LIMIT 1",
+            (list_name,),
+        ).fetchone()
+
+    def _screen_with_baseline(self, conn: sqlite3.Connection, counterparty_name: str,
+                              country: str) -> dict[str, Any]:
+        """按每个名单当前最新的已发布快照筛查，并固化当时的版本依据。"""
+        country = country.upper()
+        lists = [r["list_name"] for r in conn.execute(
+            "SELECT DISTINCT list_name FROM watchlist_snapshots WHERE status='published'"
+        ).fetchall()]
+        baseline: dict[str, int] = {}
+        hits: list[dict[str, Any]] = []
+        best_overall = 0.0
+        best_hit: dict[str, Any] | None = None
+        for list_name in lists:
+            snapshot = self._latest_snapshot(conn, list_name)
+            if snapshot is None:
+                continue
+            baseline[list_name] = snapshot["version"]
+            entries = conn.execute(
+                "SELECT * FROM watchlist_snapshot_entries WHERE snapshot_id=? ORDER BY seq",
+                (snapshot["id"],),
+            ).fetchall()
+            score, match = self._match_entries(counterparty_name, country, entries)
+            if match is None:
+                continue
+            hit = {
+                "list_name": list_name,
+                "snapshot_id": snapshot["id"],
+                "snapshot_version": snapshot["version"],
+                "entry_seq": match["seq"],
+                "entry_name": match["name"],
+                "countries": json.loads(match["countries"]),
+                "score": round(score, 4),
+            }
+            hits.append(hit)
+            if score > best_overall:
+                best_overall, best_hit = score, hit
+        detail = {
+            "screened_at": utcnow(),
+            "counterparty_name": counterparty_name,
+            "counterparty_country": country,
+            "baseline_versions": baseline,
+            "hits": hits,
+        }
+        if best_hit is not None and best_overall >= 0.9:
+            detail["match"] = best_hit
+        return detail
 
     def ingest_transaction(self, actor: str, role: str, txn_ref: str, customer_id: int,
                            amount: float, currency: str, counterparty_name: str,
@@ -352,7 +617,10 @@ class FinancialCrimeService:
                 raise DomainError("客户不存在", 404)
             entity = self._resolve_entity(conn, customer["entity_id"])
             country = counterparty_country.strip().upper()
-            match_score, match_reason = self._screen(counterparty_name.strip(), country)
+            screen_detail = self._screen_with_baseline(conn, counterparty_name.strip(), country)
+            match_detail = screen_detail.get("match")
+            match_reason = "sanctions_match:%s:%s" % (match_detail["list_name"], match_detail["entry_name"]) if match_detail else None
+            match_score = 0.95 if match_reason else 0.0
             base_risk = customer["risk_score"]
             reason = "normal"
             if match_reason:
@@ -380,10 +648,12 @@ class FinancialCrimeService:
             try:
                 cur = conn.execute(
                     """INSERT INTO transactions(txn_ref,customer_id,entity_id,amount,currency,counterparty_name,
-                       counterparty_country,status,risk_score,reason,created_by,created_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       counterparty_country,status,risk_score,reason,screen_snapshot_id,screen_detail,created_by,created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (txn_ref.strip(), customer["id"], entity["id"], amount, currency.strip().upper(),
-                     counterparty_name.strip(), country, status, risk, reason, actor, utcnow()),
+                     counterparty_name.strip(), country, status, risk, reason,
+                     match_detail["snapshot_id"] if match_detail else None,
+                     json.dumps(screen_detail, ensure_ascii=False, sort_keys=True), actor, utcnow()),
                 )
             except sqlite3.IntegrityError as exc:
                 raise DomainError("交易编号已存在", 409) from exc
@@ -410,6 +680,202 @@ class FinancialCrimeService:
             self._audit(conn, actor, "transaction.ingested", {"txn_ref": txn_ref, "status": status, "reason": reason}, entity["id"])
             transaction = dict(conn.execute("SELECT * FROM transactions WHERE id=?", (cur.lastrowid,)).fetchone())
             return {"transaction": transaction, "alert": alert, "resolved_entity_id": entity["id"]}
+
+    def run_night_review(self, actor: str, role: str, list_name: str | None = None,
+                         limit: int = 1000) -> dict[str, Any]:
+        """用最新快照重筛历史交易：原交易和原线索一律不改，只生成/撤销待办。"""
+        actor = clean_actor(actor)
+        require_role(role, {"supervisor", "director"}, "执行夜间复核")
+        try:
+            limit = max(1, min(int(limit), 10000))
+        except (TypeError, ValueError) as exc:
+            raise DomainError("复核批量上限无效") from exc
+        created, revoked, unchanged, skipped = [], [], 0, 0
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            params: list[Any] = []
+            where = "status='published'"
+            if list_name:
+                where += " AND list_name=?"
+                params.append(list_name.strip())
+            snapshots = conn.execute(
+                "SELECT * FROM watchlist_snapshots WHERE %s ORDER BY published_at DESC, id DESC" % where,
+                params,
+            ).fetchall()
+            latest_by_list: dict[str, sqlite3.Row] = {}
+            for snap in snapshots:
+                latest_by_list.setdefault(snap["list_name"], snap)
+            if list_name and not latest_by_list:
+                raise DomainError("名单不存在或尚无已发布快照", 404)
+            txns = conn.execute(
+                "SELECT * FROM transactions ORDER BY id LIMIT ?", (limit,),
+            ).fetchall()
+            now = utcnow()
+            for txn in txns:
+                detail = json.loads(txn["screen_detail"] or "{}")
+                baseline = detail.get("baseline_versions", {})
+                old_hits = {h["list_name"]: h for h in detail.get("hits", [])}
+                for current_list, snap in latest_by_list.items():
+                    old_version = baseline.get(current_list)
+                    if old_version == snap["version"]:
+                        continue
+                    entries = conn.execute(
+                        "SELECT * FROM watchlist_snapshot_entries WHERE snapshot_id=? ORDER BY seq",
+                        (snap["id"],),
+                    ).fetchall()
+                    score, match = self._match_entries(
+                        txn["counterparty_name"], txn["counterparty_country"], entries,
+                    )
+                    old_hit = old_hits.get(current_list)
+                    old_match = old_hit if old_hit and old_hit.get("score", 0) >= 0.9 else None
+                    new_match = match if match is not None and score >= 0.9 else None
+                    if old_match and new_match and old_match["entry_name"] == new_match["name"] \
+                            and old_match["snapshot_version"] == snap["version"]:
+                        unchanged += 1
+                        continue
+                    if not old_match and not new_match:
+                        continue
+                    # 该交易在该名单下被更新版本取代的未决待办先撤销，再生成当前待办。
+                    open_tasks = conn.execute(
+                        """SELECT * FROM review_tasks WHERE transaction_id=? AND list_name=?
+                           AND status='open' AND new_snapshot_id<>?""",
+                        (txn["id"], current_list, snap["id"]),
+                    ).fetchall()
+                    superseded_id: int | None = None
+                    for task in open_tasks:
+                        conn.execute(
+                            "UPDATE review_tasks SET status='revoked',resolved_at=? WHERE id=?",
+                            (now, task["id"]),
+                        )
+                        revoked.append(task["id"])
+                        superseded_id = task["id"]
+                    existing = conn.execute(
+                        "SELECT id FROM review_tasks WHERE transaction_id=? AND new_snapshot_id=?",
+                        (txn["id"], snap["id"]),
+                    ).fetchone()
+                    if existing:
+                        continue
+                    if new_match and not old_match:
+                        change_type = "new_hit"
+                        change_detail = {"new": {"entry_name": new_match["name"], "entry_seq": new_match["seq"],
+                                                 "score": round(score, 4)}}
+                    elif old_match and not new_match:
+                        change_type = "hit_cleared"
+                        change_detail = {"old": {"entry_name": old_match["entry_name"],
+                                                 "snapshot_version": old_match["snapshot_version"],
+                                                 "score": old_match["score"]}}
+                    else:
+                        change_type = "hit_changed"
+                        change_detail = {
+                            "old": {"entry_name": old_match["entry_name"],
+                                    "snapshot_version": old_match["snapshot_version"],
+                                    "score": old_match["score"]},
+                            "new": {"entry_name": new_match["name"], "entry_seq": new_match["seq"],
+                                    "score": round(score, 4)},
+                        }
+                    task_detail = {
+                        "txn_ref": txn["txn_ref"],
+                        "counterparty_name": txn["counterparty_name"],
+                        "counterparty_country": txn["counterparty_country"],
+                        "old_version": old_version,
+                        "new_version": snap["version"],
+                        **change_detail,
+                    }
+                    cur = conn.execute(
+                        """INSERT INTO review_tasks(transaction_id,list_name,old_snapshot_id,new_snapshot_id,
+                           change_type,detail,superseded_task_id,created_at)
+                           VALUES(?,?,?,?,?,?,?,?)""",
+                        (txn["id"], current_list,
+                         old_hit["snapshot_id"] if old_hit else None,
+                         snap["id"], change_type,
+                         json.dumps(task_detail, ensure_ascii=False, sort_keys=True),
+                         superseded_id, now),
+                    )
+                    created.append({"task_id": cur.lastrowid, "txn_id": txn["id"],
+                                    "list_name": current_list, "change_type": change_type})
+            self._audit(conn, actor, "watchlist.night_review",
+                        {"list_name": list_name, "created": len(created),
+                         "revoked": len(revoked)})
+            return {"created": created, "revoked": revoked, "unchanged": unchanged,
+                    "skipped": skipped, "reviewed_transactions": len(txns)}
+
+    def resolve_review_task(self, actor: str, role: str, task_id: int, decision: str,
+                            note: str) -> dict[str, Any]:
+        """处置复核待办：可关闭/可转案件；已有案件只追加复核记录，绝不回写原交易或原线索。"""
+        actor = clean_actor(actor)
+        require_role(role, {"investigator", "supervisor"}, "处置复核待办")
+        if decision not in {"confirm", "dismiss", "escalate"}:
+            raise DomainError("复核决定无效（confirm/dismiss/escalate）")
+        if not note.strip():
+            raise DomainError("复核说明不能为空", 409)
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            task = conn.execute("SELECT * FROM review_tasks WHERE id=?", (task_id,)).fetchone()
+            if not task:
+                raise DomainError("复核待办不存在", 404)
+            if task["status"] != "open":
+                raise DomainError("复核待办已处理或已撤销", 409)
+            txn = conn.execute("SELECT * FROM transactions WHERE id=?", (task["transaction_id"],)).fetchone()
+            case = conn.execute(
+                "SELECT * FROM cases WHERE id=(SELECT case_id FROM alerts WHERE transaction_id=?)",
+                (task["transaction_id"],),
+            ).fetchone()
+            if case is None:
+                case = conn.execute(
+                    "SELECT c.* FROM cases c JOIN alerts a ON a.case_id=c.id "
+                    "WHERE a.entity_id=? ORDER BY c.id DESC LIMIT 1",
+                    (txn["entity_id"],),
+                ).fetchone()
+            if case is not None:
+                self._case_access(actor, role, case)
+            detail = json.loads(task["detail"])
+            resolution = {"decision": decision, "note": note.strip()}
+            now = utcnow()
+            new_case = None
+            if decision == "escalate" and case is None:
+                case_no = "RVW-%06d" % task_id
+                cur = conn.execute(
+                    """INSERT INTO cases(case_no,entity_id,alert_id,status,risk_score,assignee,created_by,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (case_no, txn["entity_id"], None,
+                     0.95 if task["change_type"] != "hit_cleared" else txn["risk_score"],
+                     actor, actor, now, now, now),
+                )
+                case = conn.execute("SELECT * FROM cases WHERE id=?", (cur.lastrowid,)).fetchone()
+                new_case = dict(case)
+                self._audit(conn, actor, "case.created_from_review",
+                            {"case_no": case_no, "task_id": task_id}, txn["entity_id"], case["id"])
+            status = {"confirm": "confirmed", "dismiss": "dismissed", "escalate": "escalated"}[decision]
+            conn.execute(
+                "UPDATE review_tasks SET status=?,resolution=?,resolved_by=?,resolved_at=? WHERE id=?",
+                (status, json.dumps(resolution, ensure_ascii=False), actor, now, task_id),
+            )
+            review_id = None
+            if case is not None:
+                rc = conn.execute(
+                    """INSERT INTO case_reviews(case_id,task_id,transaction_id,list_name,old_snapshot_id,
+                       new_snapshot_id,change_type,detail,actor,created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    (case["id"], task_id, txn["id"], task["list_name"], task["old_snapshot_id"],
+                     task["new_snapshot_id"], task["change_type"],
+                     json.dumps({"resolution": resolution, "change": detail}, ensure_ascii=False, sort_keys=True),
+                     actor, now),
+                )
+                review_id = rc.lastrowid
+                conn.execute("INSERT INTO case_notes(case_id,actor,note,created_at) VALUES(?,?,?,?)",
+                             (case["id"], actor, "名单复核[%s/%s]：%s" % (task["list_name"], task["change_type"], note.strip()), now))
+                self._audit(conn, actor, "case.review_appended",
+                            {"task_id": task_id, "change_type": task["change_type"], "decision": decision},
+                            case["entity_id"], case["id"])
+            else:
+                self._audit(conn, actor, "review_task.resolved",
+                            {"task_id": task_id, "decision": decision})
+            return {
+                "task": dict(conn.execute("SELECT * FROM review_tasks WHERE id=?", (task_id,)).fetchone()),
+                "case_id": case["id"] if case is not None else None,
+                "case": new_case,
+                "case_review_id": review_id,
+            }
 
     def triage_alert(self, actor: str, role: str, alert_id: int, decision: str,
                     assignee: str | None = None, case_no: str | None = None,
@@ -598,7 +1064,68 @@ class FinancialCrimeService:
                 raise DomainError("案件不存在", 404)
             self._case_access(actor, role, case)
             notes = [dict(r) for r in conn.execute("SELECT * FROM case_notes WHERE case_id=? ORDER BY id", (case_id,)).fetchall()]
-            return {"case": dict(case), "notes": notes}
+            reviews = [dict(r) for r in conn.execute(
+                "SELECT * FROM case_reviews WHERE case_id=? ORDER BY id", (case_id,)
+            ).fetchall()]
+            for row in reviews:
+                row["detail"] = json.loads(row["detail"])
+            return {"case": dict(case), "notes": notes, "reviews": reviews}
+
+    def list_snapshots(self, actor: str, role: str, list_name: str | None = None) -> dict[str, Any]:
+        actor = clean_actor(actor)
+        if role not in SENSITIVE_ROLES:
+            raise DomainError("角色无权查看名单版本", 403)
+        with self.connect() as conn:
+            if list_name:
+                rows = conn.execute(
+                    "SELECT * FROM watchlist_snapshots WHERE list_name=? AND status='published' ORDER BY version",
+                    (list_name,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM watchlist_snapshots WHERE status='published' ORDER BY list_name, version"
+                ).fetchall()
+            return {"snapshots": [dict(r) for r in rows]}
+
+    def get_snapshot(self, actor: str, role: str, snapshot_id: int) -> dict[str, Any]:
+        actor = clean_actor(actor)
+        if role not in SENSITIVE_ROLES:
+            raise DomainError("角色无权查看名单版本", 403)
+        with self.connect() as conn:
+            snap = conn.execute("SELECT * FROM watchlist_snapshots WHERE id=?", (snapshot_id,)).fetchone()
+            if not snap or snap["status"] != "published":
+                raise DomainError("名单快照不存在", 404)
+            entries = [dict(r) for r in conn.execute(
+                "SELECT seq,name,countries FROM watchlist_snapshot_entries WHERE snapshot_id=? ORDER BY seq",
+                (snapshot_id,),
+            ).fetchall()]
+            for entry in entries:
+                entry["countries"] = json.loads(entry["countries"])
+            return {"snapshot": dict(snap), "entries": entries}
+
+    def list_review_tasks(self, actor: str, role: str, status_filter: str = "open") -> dict[str, Any]:
+        actor = clean_actor(actor)
+        if role not in SENSITIVE_ROLES:
+            raise DomainError("角色无权查看复核待办", 403)
+        if status_filter not in {"open", "all", "resolved"}:
+            raise DomainError("待办过滤条件无效")
+        with self.connect() as conn:
+            if status_filter == "all":
+                rows = conn.execute("SELECT * FROM review_tasks ORDER BY id DESC LIMIT 200").fetchall()
+            elif status_filter == "resolved":
+                rows = conn.execute(
+                    "SELECT * FROM review_tasks WHERE status<>'open' ORDER BY id DESC LIMIT 200"
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM review_tasks WHERE status='open' ORDER BY id DESC LIMIT 200"
+                ).fetchall()
+            tasks = [dict(r) for r in rows]
+            for task in tasks:
+                task["detail"] = json.loads(task["detail"])
+                if task.get("resolution"):
+                    task["resolution"] = json.loads(task["resolution"])
+            return {"tasks": tasks}
 
     def state(self, actor: str = "", role: str = "viewer") -> dict[str, Any]:
         if role not in SENSITIVE_ROLES:
@@ -619,7 +1146,19 @@ class FinancialCrimeService:
             else:
                 alerts = [dict(r) for r in conn.execute("SELECT * FROM alerts ORDER BY id DESC LIMIT 100").fetchall()]
             timeline = [dict(r) for r in conn.execute("SELECT * FROM timeline ORDER BY id DESC LIMIT 200").fetchall()]
-        return {"entities": entities, "transactions": transactions, "alerts": alerts, "cases": cases, "timeline": timeline, "access_limited": False}
+            snapshots = [dict(r) for r in conn.execute(
+                "SELECT * FROM watchlist_snapshots WHERE status='published' ORDER BY id DESC LIMIT 50"
+            ).fetchall()]
+            review_tasks = [dict(r) for r in conn.execute(
+                "SELECT * FROM review_tasks ORDER BY id DESC LIMIT 100"
+            ).fetchall()]
+            for task in review_tasks:
+                task["detail"] = json.loads(task["detail"])
+            for row in transactions:
+                row["screen_detail"] = json.loads(row["screen_detail"] or "{}")
+        return {"entities": entities, "transactions": transactions, "alerts": alerts,
+                "cases": cases, "timeline": timeline, "snapshots": snapshots,
+                "review_tasks": review_tasks, "access_limited": False}
 
     def seed_demo(self) -> dict[str, Any]:
         with self.connect() as conn:
@@ -627,9 +1166,15 @@ class FinancialCrimeService:
                 return {"seeded": False, "reason": "已有数据"}
         entity = self.create_entity("analyst-demo", "analyst", "organization", "海岳贸易有限公司", ["海岳贸易"])
         customer = self.create_customer("analyst-demo", "analyst", entity["id"], "CUST-0001", "CN", "贸易", False, 0.2)
-        self.add_or_update_watchlist("sup-demo", "supervisor", "OFAC", "海岳贸易有限公司", ["CN"])
+        snapshot = self.publish_watchlist(
+            "sup-demo", "supervisor", "OFAC",
+            [{"name": "海岳贸易有限公司", "countries": ["CN"]}],
+            note="演示名单第一版",
+        )
         result = self.ingest_transaction("analyst-demo", "analyst", "TXN-DEMO-0001", customer["id"], 150000, "USD", "海岳贸易有限公司", "CN")
-        return {"seeded": True, "entity_id": entity["id"], "customer_id": customer["id"], "alert_id": result["alert"]["id"] if result["alert"] else None}
+        return {"seeded": True, "entity_id": entity["id"], "customer_id": customer["id"],
+                "alert_id": result["alert"]["id"] if result["alert"] else None,
+                "snapshot_version": snapshot["version"]}
 
 
 class ApiHandler(BaseHTTPRequestHandler):
@@ -676,6 +1221,23 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self._send(200, {"status": "ok", "service": "financial-crime"})
             elif path == "/api/state":
                 self._send(200, self.service.state(actor, role))
+            elif path == "/api/snapshots":
+                query = urlparse(self.path).query
+                list_name = None
+                if query:
+                    from urllib.parse import parse_qs
+                    parsed = parse_qs(query)
+                    list_name = parsed.get("list_name", [None])[0]
+                self._send(200, self.service.list_snapshots(actor, role, list_name))
+            elif path.startswith("/api/snapshots/"):
+                self._send(200, self.service.get_snapshot(actor, role, int(path.split("/")[3])))
+            elif path == "/api/reviews":
+                query = urlparse(self.path).query
+                status_filter = "open"
+                if query:
+                    from urllib.parse import parse_qs
+                    status_filter = parse_qs(query).get("status", ["open"])[0]
+                self._send(200, self.service.list_review_tasks(actor, role, status_filter))
             elif path.startswith("/api/cases/"):
                 self._send(200, self.service.get_case(actor, role, int(path.split("/")[3])))
             else:
@@ -696,6 +1258,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.create_customer(actor, role, **data)
             elif path == "/api/watchlist":
                 result = self.service.add_or_update_watchlist(actor, role, **data)
+            elif path == "/api/watchlist/publish":
+                result = self.service.publish_watchlist(actor, role, **data)
+            elif path == "/api/reviews/night-run":
+                result = self.service.run_night_review(actor, role, **data)
+            elif path == "/api/reviews/resolve":
+                result = self.service.resolve_review_task(actor, role, **data)
             elif path == "/api/transactions":
                 result = self.service.ingest_transaction(actor, role, **data)
             elif path == "/api/alerts/triage":
